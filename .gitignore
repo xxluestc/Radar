@@ -1,0 +1,5 @@
+*.o
+radar_bsd
+*.bin
+*.elf
+*.log
