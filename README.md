@@ -7,7 +7,7 @@
 ```
 radar_project/
 ├── src/
-│   └── radar_bsd.c          # 雷达BSD数据接收与解析程序
+│   └── radar_bsd.c          # 雷达BSD主程序 (MP257 A35核运行)
 ├── device-tree/
 │   └── patches/              # 设备树修改补丁
 ├── m33-firmware/
@@ -16,6 +16,7 @@ radar_project/
 ├── Makefile                  # 交叉编译Makefile
 ├── knowledge_base.md         # 项目知识库
 ├── debug_log.md              # 调试日志
+├── radar_debug.py            # USB-TTL调试工具 (PC端)
 └── README.md                 # 本文件
 ```
 
@@ -38,7 +39,29 @@ radar_project/
 
 ## 软件组件
 
-### 1. 雷达BSD程序 (radar_bsd)
+### 1. USB-TTL 调试工具 (radar_debug.py)
+
+PC 端 Python 脚本，通过 USB-TTL 直连雷达模块，用于快速验证雷达硬件和协议通信。
+
+**运行**:
+```bash
+python radar_debug.py              # 默认配置BSD + 持续监控
+python radar_debug.py -m           # 仅监控（不发送配置命令）
+python radar_debug.py -s           # 波特率扫描 + 监控
+python radar_debug.py 115200       # 指定波特率
+```
+
+**功能**:
+- 发送配置命令（开启BSD检测、自动上报、获取版本）
+- 帧解析（0x5A上报 / 0x59回复 / 0x58命令）
+- 波特率扫描
+- 校验和自动计算（命令帧16-bit，上报帧8-bit）
+
+**重要**: 雷达仅检测到有效目标才上报数据。最低检测速度 **6 km/h**，首次建立检测需 **5 秒**。
+
+---
+
+### 2. 雷达BSD程序 (radar_bsd)
 
 交叉编译的aarch64 Linux程序，运行在Cortex-A35核上。
 
@@ -72,14 +95,14 @@ make
 # -n          禁用预警
 ```
 
-### 2. 设备树修改
+### 3. 设备树修改
 
 为使UART4可用于A35核，需要:
 1. 在`&pinctrl`段添加UART4引脚配置(PB6/PB7, AF3)
 2. 启用UART4节点并禁用DMA
 3. 修改M33核固件，释放UART4资源
 
-### 3. M33核固件修改
+### 4. M33核固件修改
 
 原始M33核固件通过RIFSC请求了UART4资源作为调试串口，导致A35核无法访问UART4。
 
