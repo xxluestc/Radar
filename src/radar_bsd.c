@@ -12,10 +12,11 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 
 #define DEFAULT_UART_DEVICE "/dev/ttySTM3"
 #define DEFAULT_BAUDRATE 921600
-#define MAX_FRAME_SIZE 256
+#define MAX_FRAME_SIZE 512
 #define MAX_BSD_OBJECTS 8
 
 #define FRAME_HEAD_CMD 0x58
@@ -23,6 +24,11 @@
 #define FRAME_HEAD_REPORT 0x5A
 
 #define REPORT_TYPE_BSD 7
+
+#include <linux/gpio.h>
+
+#define GPIO_CHIP "/dev/gpiochip1"
+#define GPIO_OUT_PIN 2
 
 #pragma pack(push, 1)
 typedef struct {
@@ -41,11 +47,14 @@ typedef struct {
 
 static volatile int g_running = 1;
 static int g_fd = -1;
+static int g_gpio_fd = -1;
 static int g_verbose = 0;
 static int g_warning_enabled = 1;
 static int g_warning_distance = 5;
 static int g_warning_approach_speed = 2;
 static FILE *g_log_file = NULL;
+static uint8_t g_last_sent_cmd = 0;
+static int g_header_loss_detected = 0;
 
 static void signal_handler(int sig)
 {
@@ -100,7 +109,16 @@ static int set_uart(int fd, int baudrate)
     return 0;
 }
 
-static uint8_t calc_checksum(const uint8_t *data, int len)
+static uint16_t calc_checksum(const uint8_t *data, int len)
+{
+    uint32_t sum = 0;
+    for (int i = 0; i < len; i++) {
+        sum += data[i];
+    }
+    return (uint16_t)(sum & 0xFFFF);
+}
+
+static uint8_t calc_report_checksum(const uint8_t *data, int len)
 {
     uint32_t sum = 0;
     for (int i = 0; i < len; i++) {
@@ -147,13 +165,13 @@ static void print_hex(const uint8_t *data, int len)
     }
 }
 
-static int send_cmd(int fd, uint8_t cmd_group, uint8_t cmd, const uint8_t *params, int param_len)
+static int send_cmd(int fd, uint8_t cmd_byte, const uint8_t *params, int param_len)
 {
     uint8_t frame[64];
     int idx = 0;
 
     frame[idx++] = FRAME_HEAD_CMD;
-    frame[idx++] = (cmd_group << 5) | cmd;
+    frame[idx++] = cmd_byte;
     frame[idx++] = (uint8_t)param_len;
 
     if (params && param_len > 0) {
@@ -161,9 +179,9 @@ static int send_cmd(int fd, uint8_t cmd_group, uint8_t cmd, const uint8_t *param
         idx += param_len;
     }
 
-    uint8_t checksum = calc_checksum(frame, idx);
-    frame[idx++] = checksum;
-    frame[idx++] = 0x00;
+    uint16_t checksum = calc_checksum(frame, idx);
+    frame[idx++] = (uint8_t)(checksum & 0xFF);
+    frame[idx++] = (uint8_t)((checksum >> 8) & 0xFF);
 
     int written = write(fd, frame, idx);
     if (written != idx) {
@@ -172,6 +190,8 @@ static int send_cmd(int fd, uint8_t cmd_group, uint8_t cmd, const uint8_t *param
     }
 
     tcdrain(fd);
+
+    g_last_sent_cmd = cmd_byte;
 
     if (g_verbose) {
         printf("TX: ");
@@ -182,26 +202,68 @@ static int send_cmd(int fd, uint8_t cmd_group, uint8_t cmd, const uint8_t *param
     return 0;
 }
 
-static int send_bsd_enable_cmd(int fd)
+static int send_system_reset_cmd(int fd)
 {
-    uint8_t params[2] = {0x01, 0x00};
-    return send_cmd(fd, 0x06, 0x10, params, 2);
+    uint8_t param = 0x01;
+    return send_cmd(fd, 0x13, &param, 1);
 }
 
-static int send_auto_report_enable_cmd(int fd)
+static int send_get_version_cmd(int fd)
 {
-    uint8_t params[2] = {0x01, 0x00};
-    return send_cmd(fd, 0x06, 0x12, params, 2);
+    return send_cmd(fd, 0xFE, NULL, 0);
 }
 
-static int send_set_baudrate_cmd(int fd, uint32_t baudrate)
+static int send_radar_enable_cmd(int fd)
 {
-    uint8_t params[4];
-    params[0] = baudrate & 0xFF;
-    params[1] = (baudrate >> 8) & 0xFF;
-    params[2] = (baudrate >> 16) & 0xFF;
-    params[3] = (baudrate >> 24) & 0xFF;
-    return send_cmd(fd, 0x00, 0x19, params, 4);
+    uint8_t param = 0x01;
+    return send_cmd(fd, 0xD1, &param, 1);
+}
+
+static int send_radar_disable_cmd(int fd)
+{
+    uint8_t param = 0x00;
+    return send_cmd(fd, 0xD1, &param, 1);
+}
+
+static int send_get_radar_state_cmd(int fd)
+{
+    return send_cmd(fd, 0xD0, NULL, 0);
+}
+
+static int send_get_algo_type_cmd(int fd)
+{
+    return send_cmd(fd, 0xD2, NULL, 0);
+}
+
+static int send_set_ulp_active_time_cmd(int fd, uint8_t seconds)
+{
+    return send_cmd(fd, 0x90, &seconds, 1);
+}
+
+static int init_gpio_out(void)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/sys/class/gpio/gpio%d/value", GPIO_OUT_PIN + 32);
+    g_gpio_fd = open(path, O_RDONLY);
+    if (g_gpio_fd < 0) {
+        snprintf(path, sizeof(path), "/sys/class/gpio/gpio%d/value", GPIO_OUT_PIN + 32 * 1);
+        g_gpio_fd = open(path, O_RDONLY);
+    }
+    if (g_gpio_fd < 0) {
+        fprintf(stderr, "Cannot open GPIO OUT sysfs: %s\n", strerror(errno));
+        return -1;
+    }
+    return g_gpio_fd;
+}
+
+static int read_gpio_out(int line_fd)
+{
+    char buf[4] = {0};
+    lseek(line_fd, 0, SEEK_SET);
+    if (read(line_fd, buf, sizeof(buf) - 1) < 1) {
+        return -1;
+    }
+    return atoi(buf);
 }
 
 static void process_bsd_report(const bsd_det_info_t *bsd)
@@ -217,20 +279,20 @@ static void process_bsd_report(const bsd_det_info_t *bsd)
 
     for (int i = 0; i < obj_count; i++) {
         const bsd_obj_info_t *obj = &bsd->obj[i];
-        log_message("  Target[%d]: ID=%d, Distance=%dm, Angle=%d°, Speed=%dm/s\n",
+        log_message("  Target[%d]: ID=%d, Distance=%dm, Angle=%d, Speed=%dm/s\n",
                     i, obj->objId, obj->range_val, obj->angle_val, obj->velo_val);
 
         if (g_warning_enabled) {
             if (obj->range_val > 0 && obj->range_val <= g_warning_distance && obj->velo_val > g_warning_approach_speed) {
                 danger_detected = 1;
-                log_message("  ⚠️  WARNING: Target %d approaching! Distance=%dm, Speed=%dm/s\n",
+                log_message("  WARNING: Target %d approaching! Distance=%dm, Speed=%dm/s\n",
                            obj->objId, obj->range_val, obj->velo_val);
             }
         }
     }
 
     if (g_warning_enabled && danger_detected) {
-        log_message("🚨 DANGER ALERT: Approaching target detected from behind!\n");
+        log_message("DANGER ALERT: Approaching target detected from behind!\n");
     }
 }
 
@@ -290,17 +352,62 @@ static int process_report_frame(const uint8_t *payload, int payload_len)
 static int process_response_frame(const uint8_t *payload, int payload_len)
 {
     if (g_verbose) {
-        printf("Response: ");
+        printf("RX Response payload: ");
         print_hex(payload, payload_len);
         printf("\n");
     }
 
-    if (payload_len >= 3) {
-        uint8_t status = payload[2];
-        if (status == 0x00) {
-            if (g_verbose) printf("  Command executed successfully\n");
+    if (payload_len < 3) {
+        if (g_verbose) printf("Response too short: %d bytes\n", payload_len);
+        return -1;
+    }
+
+    uint8_t cmd_byte = payload[0];
+    uint8_t param_len = payload[1];
+    const uint8_t *params = &payload[2];
+
+    if (2 + param_len > payload_len) {
+        if (g_verbose) printf("Response param_len=%d exceeds payload\n", param_len);
+        return -1;
+    }
+
+    if (cmd_byte == 0xFE) {
+        if (param_len >= 8) {
+            log_message("Version: SW=%d.%d.%d, Customer=%d.%d, CI=%d.%d, Algo=%d\n",
+                       params[0], params[1], params[2],
+                       params[3], params[4],
+                       params[5], params[6],
+                       params[7]);
         } else {
-            if (g_verbose) printf("  Command failed, status=0x%02X\n", status);
+            log_message("Version response (short): ");
+            print_hex(params, param_len);
+            printf("\n");
+        }
+    } else if (cmd_byte == 0xD0) {
+        if (param_len >= 1) {
+            log_message("Radar state: %s\n", params[0] ? "ON" : "OFF");
+        }
+    } else if (cmd_byte == 0xD2) {
+        if (param_len >= 1) {
+            log_message("Algorithm type: %d\n", params[0]);
+        }
+    } else if (cmd_byte == 0xD1) {
+        if (param_len >= 1) {
+            log_message("Radar enable: %s\n", params[0] == 0x00 ? "SUCCESS" : "FAILED");
+        }
+    } else if (cmd_byte == 0x13) {
+        if (param_len >= 1) {
+            log_message("System Reset: %s\n", params[0] == 0x00 ? "SUCCESS" : "FAILED");
+        }
+    } else if (cmd_byte == 0x90) {
+        if (param_len >= 1) {
+            log_message("ULP active time set: %s\n", params[0] == 0x00 ? "SUCCESS" : "FAILED");
+        }
+    } else {
+        if (g_verbose) {
+            printf("Response CMD=0x%02X, param_len=%d: ", cmd_byte, param_len);
+            print_hex(params, param_len);
+            printf("\n");
         }
     }
 
@@ -309,36 +416,59 @@ static int process_response_frame(const uint8_t *payload, int payload_len)
 
 static int process_frame(const uint8_t *frame, int frame_len)
 {
-    if (frame_len < 3) return -1;
+    if (frame_len < 4) return -1;
 
     uint8_t head = frame[0];
-    uint8_t len = frame[1];
 
     if (head == FRAME_HEAD_REPORT) {
         if (g_verbose) {
-            printf("RX Report: ");
+            printf("RX Report frame: ");
             print_hex(frame, frame_len);
             printf("\n");
+        }
+        uint8_t len = frame[1];
+        if (2 + len + 1 > frame_len) return -1;
+        uint8_t check = calc_report_checksum(frame, 2 + len);
+        if (check != frame[2 + len]) {
+            if (g_verbose) printf("Report checksum mismatch: calc=0x%02X, recv=0x%02X\n", check, frame[2 + len]);
+            return -1;
         }
         return process_report_frame(&frame[2], len);
     } else if (head == FRAME_HEAD_RESP) {
         if (g_verbose) {
-            printf("RX Response: ");
+            printf("RX Response frame: ");
             print_hex(frame, frame_len);
             printf("\n");
         }
-        return process_response_frame(&frame[2], len);
+        if (frame_len < 3) return -1;
+        uint8_t cmd_byte = frame[1];
+        uint8_t param_len = frame[2];
+        if (3 + param_len + 2 > frame_len) return -1;
+        uint16_t recv_checksum = frame[3 + param_len] | (frame[3 + param_len + 1] << 8);
+        uint16_t calc_check = calc_checksum(frame, 3 + param_len);
+        if (calc_check != recv_checksum) {
+            if (g_verbose) printf("Response checksum mismatch: calc=0x%04X, recv=0x%04X\n", calc_check, recv_checksum);
+            return -1;
+        }
+        uint8_t payload[256];
+        payload[0] = cmd_byte;
+        payload[1] = param_len;
+        if (param_len > 0) {
+            memcpy(&payload[2], &frame[3], param_len);
+        }
+        return process_response_frame(payload, 2 + param_len);
     }
 
     return -1;
 }
 
+static uint8_t g_rx_buf[512];
+static int g_rx_len = 0;
+
 static int receive_and_process(int fd)
 {
-    static uint8_t rx_buf[512];
-    static int rx_len = 0;
 
-    int bytes_read = read(fd, rx_buf + rx_len, sizeof(rx_buf) - rx_len - 1);
+    int bytes_read = read(fd, g_rx_buf + g_rx_len, sizeof(g_rx_buf) - g_rx_len - 1);
     if (bytes_read < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             return 0;
@@ -350,51 +480,183 @@ static int receive_and_process(int fd)
         return 0;
     }
 
-    rx_len += bytes_read;
+    if (g_verbose) {
+        printf("RX raw (%d bytes): ", bytes_read);
+        print_hex(g_rx_buf + g_rx_len, bytes_read);
+        printf("\n");
+    }
 
-    while (rx_len >= 3) {
-        uint8_t head = rx_buf[0];
+    g_rx_len += bytes_read;
+
+    while (g_rx_len >= 4) {
+        uint8_t head = g_rx_buf[0];
 
         if (head != FRAME_HEAD_REPORT && head != FRAME_HEAD_RESP && head != FRAME_HEAD_CMD) {
+            if (g_last_sent_cmd != 0 && g_rx_len >= 3) {
+                uint8_t repaired[512];
+                repaired[0] = FRAME_HEAD_RESP;
+                repaired[1] = g_last_sent_cmd;
+                int repaired_len = 2 + g_rx_len;
+                if (repaired_len > (int)sizeof(repaired)) repaired_len = sizeof(repaired);
+                memcpy(&repaired[2], g_rx_buf, g_rx_len);
+
+                if (repaired_len >= 5) {
+                    uint8_t param_len = repaired[2];
+                    int expected_frame_len = 3 + param_len + 2;
+                    if (expected_frame_len == repaired_len) {
+                        uint16_t recv_checksum = repaired[3 + param_len] | (repaired[3 + param_len + 1] << 8);
+                        uint16_t calc_check = calc_checksum(repaired, 3 + param_len);
+                        if (calc_check == recv_checksum) {
+                            if (!g_header_loss_detected) {
+                                g_header_loss_detected = 1;
+                                log_message("Header loss compensation enabled (CH342F interference detected)\n");
+                            }
+                            if (g_verbose) {
+                                printf("RX repaired (lost 0x59+CMD): ");
+                                print_hex(repaired, repaired_len);
+                                printf("\n");
+                            }
+                            process_frame(repaired, repaired_len);
+                            g_rx_len = 0;
+                            g_last_sent_cmd = 0;
+                            continue;
+                        }
+                    }
+                }
+
+                if (g_last_sent_cmd != 0 && g_rx_len >= 2) {
+                    repaired[0] = FRAME_HEAD_RESP;
+                    int repaired_len2 = 1 + g_rx_len;
+                    if (repaired_len2 > (int)sizeof(repaired)) repaired_len2 = sizeof(repaired);
+                    memcpy(&repaired[1], g_rx_buf, g_rx_len);
+
+                    if (repaired_len2 >= 5) {
+                        uint8_t param_len2 = repaired[2];
+                        int expected_frame_len2 = 3 + param_len2 + 2;
+                        if (expected_frame_len2 == repaired_len2) {
+                            uint16_t recv_checksum2 = repaired[3 + param_len2] | (repaired[3 + param_len2 + 1] << 8);
+                            uint16_t calc_check2 = calc_checksum(repaired, 3 + param_len2);
+                            if (calc_check2 == recv_checksum2) {
+                                if (!g_header_loss_detected) {
+                                    g_header_loss_detected = 1;
+                                    log_message("Header loss compensation enabled (lost 0x59 only)\n");
+                                }
+                                if (g_verbose) {
+                                    printf("RX repaired (lost 0x59): ");
+                                    print_hex(repaired, repaired_len2);
+                                    printf("\n");
+                                }
+                                process_frame(repaired, repaired_len2);
+                                g_rx_len = 0;
+                                g_last_sent_cmd = 0;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+
             int i;
-            for (i = 1; i < rx_len; i++) {
-                if (rx_buf[i] == FRAME_HEAD_REPORT || rx_buf[i] == FRAME_HEAD_RESP || rx_buf[i] == FRAME_HEAD_CMD) {
+            for (i = 1; i < g_rx_len; i++) {
+                if (g_rx_buf[i] == FRAME_HEAD_REPORT || g_rx_buf[i] == FRAME_HEAD_RESP || g_rx_buf[i] == FRAME_HEAD_CMD) {
                     break;
                 }
             }
             if (g_verbose && i > 1) {
-                printf("Skipped %d invalid bytes\n", i);
+                printf("Skipped %d invalid bytes: ", i);
+                print_hex(g_rx_buf, i);
+                printf("\n");
             }
-            memmove(rx_buf, rx_buf + i, rx_len - i);
-            rx_len -= i;
+            memmove(g_rx_buf, g_rx_buf + i, g_rx_len - i);
+            g_rx_len -= i;
+            if (g_rx_len == 0) break;
             continue;
         }
 
-        uint8_t len = rx_buf[1];
-        int total_frame_len = 2 + len + 1;
+        if (g_rx_len < 2) break;
 
-        if (total_frame_len > rx_len) {
+        int total_frame_len;
+        if (head == FRAME_HEAD_REPORT) {
+            uint8_t len = g_rx_buf[1];
+            total_frame_len = 2 + len + 1;
+        } else if (head == FRAME_HEAD_RESP) {
+            if (g_rx_len < 3) break;
+            uint8_t param_len = g_rx_buf[2];
+            total_frame_len = 3 + param_len + 2;
+        } else if (head == FRAME_HEAD_CMD) {
+            if (g_rx_len < 3) break;
+            uint8_t param_len = g_rx_buf[2];
+            total_frame_len = 3 + param_len + 2;
+        } else {
+            memmove(g_rx_buf, g_rx_buf + 1, g_rx_len - 1);
+            g_rx_len -= 1;
+            continue;
+        }
+
+        if (total_frame_len > (int)sizeof(g_rx_buf)) {
+            if (g_verbose) printf("Invalid frame length %d, discarding first byte\n", total_frame_len);
+            memmove(g_rx_buf, g_rx_buf + 1, g_rx_len - 1);
+            g_rx_len -= 1;
+            continue;
+        }
+
+        if (total_frame_len > g_rx_len) {
             break;
         }
 
-        uint8_t checksum = calc_checksum(rx_buf, 2 + len);
-        if (checksum != rx_buf[2 + len]) {
-            if (g_verbose) {
-                printf("Checksum mismatch: calc=0x%02X, recv=0x%02X\n", checksum, rx_buf[2 + len]);
-            }
-            memmove(rx_buf, rx_buf + 1, rx_len - 1);
-            rx_len--;
-            continue;
-        }
+        process_frame(g_rx_buf, total_frame_len);
 
-        process_frame(rx_buf, total_frame_len);
-
-        memmove(rx_buf, rx_buf + total_frame_len, rx_len - total_frame_len);
-        rx_len -= total_frame_len;
+        memmove(g_rx_buf, g_rx_buf + total_frame_len, g_rx_len - total_frame_len);
+        g_rx_len -= total_frame_len;
     }
 
-    if (rx_len >= (int)sizeof(rx_buf) - 1) {
-        rx_len = 0;
+    if (g_rx_len >= (int)sizeof(g_rx_buf) - 1) {
+        g_rx_len = 0;
+    }
+
+    return 0;
+}
+
+static int send_cmd_wait_response(int fd, uint8_t cmd_byte, const uint8_t *params, int param_len, int timeout_ms)
+{
+    {
+        uint8_t tmp[256];
+        while (read(fd, tmp, sizeof(tmp)) > 0) { }
+    }
+
+    g_rx_len = 0;
+
+    fd_set rfds;
+    struct timeval tv;
+    FD_ZERO(&rfds);
+    FD_SET(fd, &rfds);
+    tv.tv_sec = 0;
+    tv.tv_usec = 1000;
+    select(fd + 1, &rfds, NULL, NULL, &tv);
+
+    if (send_cmd(fd, cmd_byte, params, param_len) != 0) {
+        return -1;
+    }
+
+    struct timeval start, now;
+    gettimeofday(&start, NULL);
+
+    while (g_running) {
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+        tv.tv_sec = 0;
+        tv.tv_usec = 5000;
+
+        int ret = select(fd + 1, &rfds, NULL, NULL, &tv);
+        if (ret > 0 && FD_ISSET(fd, &rfds)) {
+            receive_and_process(fd);
+        }
+
+        gettimeofday(&now, NULL);
+        int elapsed = (now.tv_sec - start.tv_sec) * 1000 + (now.tv_usec - start.tv_usec) / 1000;
+        if (elapsed >= timeout_ms) {
+            break;
+        }
     }
 
     return 0;
@@ -451,6 +713,14 @@ int main(int argc, char *argv[])
     log_message("Warning: distance<=%dm, approach_speed>%dm/s, enabled=%d\n",
                g_warning_distance, g_warning_approach_speed, g_warning_enabled);
 
+    int gpio_line_fd = init_gpio_out();
+    if (gpio_line_fd >= 0) {
+        int val = read_gpio_out(gpio_line_fd);
+        log_message("Radar OUT (PB2) initial state: %d\n", val);
+    } else {
+        log_message("GPIO OUT pin not available, continuing without GPIO\n");
+    }
+
     g_fd = open(device, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (g_fd < 0) {
         fprintf(stderr, "Cannot open %s: %s\n", device, strerror(errno));
@@ -465,17 +735,51 @@ int main(int argc, char *argv[])
 
     log_message("UART configured successfully\n");
 
-    usleep(100000);
+    log_message("Step 1: Flushing any stale data...\n");
+    {
+        uint8_t tmp[256];
+        int total_flushed = 0;
+        while (1) {
+            int n = read(g_fd, tmp, sizeof(tmp));
+            if (n <= 0) break;
+            total_flushed += n;
+        }
+        if (g_verbose) printf("Flushed %d bytes\n", total_flushed);
+    }
 
-    log_message("Enabling BSD detection...\n");
-    send_bsd_enable_cmd(g_fd);
-    usleep(50000);
+    log_message("Step 2: Setting ULP active time to 255s (prevent sleep)...\n");
+    send_cmd_wait_response(g_fd, 0x90, (uint8_t[]){0xFF}, 1, 1000);
 
-    log_message("Enabling auto report...\n");
-    send_auto_report_enable_cmd(g_fd);
-    usleep(50000);
+    log_message("Step 3: Sending initialization commands...\n");
+    send_cmd_wait_response(g_fd, 0xFE, NULL, 0, 1000);
+    send_cmd_wait_response(g_fd, 0xD0, NULL, 0, 1000);
+    send_cmd_wait_response(g_fd, 0xD2, NULL, 0, 1000);
+    send_cmd_wait_response(g_fd, 0xD1, (uint8_t[]){0x01}, 1, 1000);
 
-    log_message("Waiting for radar data...\n");
+    log_message("Step 4: Reading all responses...\n");
+    {
+        struct timeval start, now;
+        gettimeofday(&start, NULL);
+        while (g_running) {
+            fd_set rfds;
+            struct timeval tv;
+            FD_ZERO(&rfds);
+            FD_SET(g_fd, &rfds);
+            tv.tv_sec = 0;
+            tv.tv_usec = 100000;
+            int ret = select(g_fd + 1, &rfds, NULL, NULL, &tv);
+            if (ret > 0 && FD_ISSET(g_fd, &rfds)) {
+                receive_and_process(g_fd);
+            }
+            gettimeofday(&now, NULL);
+            if ((now.tv_sec - start.tv_sec) >= 3) break;
+        }
+    }
+
+    log_message("Step 9: Entering main loop - waiting for BSD reports...\n");
+
+    int last_gpio_val = -1;
+    int loop_count = 0;
 
     while (g_running) {
         fd_set rfds;
@@ -497,13 +801,25 @@ int main(int argc, char *argv[])
         if (ret > 0 && FD_ISSET(g_fd, &rfds)) {
             receive_and_process(g_fd);
         }
+
+        if (gpio_line_fd >= 0) {
+            loop_count++;
+            if (loop_count >= 10) {
+                loop_count = 0;
+                int val = read_gpio_out(gpio_line_fd);
+                if (val >= 0 && val != last_gpio_val) {
+                    log_message("Radar OUT (PB2) changed: %d -> %d\n", last_gpio_val, val);
+                    last_gpio_val = val;
+                }
+            }
+        }
     }
 
     log_message("Radar BSD Detection Program stopping\n");
 
-    if (g_log_file) {
-        fclose(g_log_file);
-    }
+    if (gpio_line_fd >= 0) close(gpio_line_fd);
+    if (g_gpio_fd >= 0) close(g_gpio_fd);
+    if (g_log_file) fclose(g_log_file);
     close(g_fd);
 
     return 0;

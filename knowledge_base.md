@@ -108,18 +108,44 @@ typedef struct {
 
 | UART | 引脚 | A35核设备 | 用途 | 备注 |
 |------|------|----------|------|------|
-| USART2 | PG14/PG15 | /dev/ttySTM0 | A35调试串口 | |
-| UART4 | PB6/PB7 | /dev/ttySTM3 | M33调试串口 | ⚠️ 被M33核占用 |
+| USART2 | PA4/PA8 | /dev/ttySTM0 | A35调试串口 | |
+| UART4 | PB6/PB7 | /dev/ttySTM3 | **雷达通信** | M33已释放，921600bps |
 | UART7 | PD0/PD3 | /dev/ttySTM1 | RS232 | 有TPT3232E电平转换 |
-| USART1 | PA12/PA15 | - | RS485 | 有TP8485E芯片 |
-| LPUART1 | - | - | M33备用 | |
+| USART1 | PG14/PG15 | /dev/ttySTM2 | RS485 | 有TP8485E芯片 |
+| LPUART1 | PZ9/PZ4 | - | M33调试串口 | 替换UART4，40pin pin7/pin11 |
 
 ### 3.2 RIFSC资源隔离
 
 STM32MP257使用RIFSC(Resource Isolation Framework)管理外设访问权限：
-- M33核通过`ResMgr_Request(RESMGR_RESOURCE_RIFSC, STM32MP25_RIFSC_UART4_ID)`请求UART4
-- 一旦M33核获取了UART4的RIFSC权限，A35核无法访问UART4硬件寄存器
-- 必须修改M33固件，不请求UART4资源，A35核才能使用
+- M33核通过BSP_COM_Init自动请求LPUART1的RIFSC权限（COM_CM33 → LPUART1）
+- M33同时通过RIF保护PZ4/PZ9引脚不被A35访问
+- UART4完全释放给A35核，无RIFSC冲突
+- A35设备树中I2C8已禁用（PZ4/PZ9与LPUART1引脚冲突）
+
+### 3.3 40pin扩展排针(J9)引脚定义
+
+| 左侧(奇数) | 引脚号 | 右侧(偶数) |
+|-----------|--------|-----------|
+| VCC3.3 | 1-2 | VCC5 |
+| I2C7_SDA (PD14) | 3-4 | VCC5 |
+| I2C7_SCL (PD15) | 5-6 | GND |
+| I2C8_SDA / LPUART1_TX (PZ9) | 7-8 | UART4_TX (PB7) |
+| GND | 9-10 | UART4_RX (PB6) |
+| I2C8_SCL / LPUART1_RX (PZ4) | 11-12 | DSI_LCD_ID (PF10) |
+| DSI_TP_INT (PB2) | 13-14 | GND |
+| DSI_TP_RST (PB1) | 15-16 | DSI_BL (PB0) |
+| VCC3.3 | 17-18 | FAN_PWM (PB10) |
+| SPI8_MOSI (PZ0) | 19-20 | GND |
+| SPI8_MISO (PZ1) | 21-22 | LVDS_TP_INT (PB5) |
+| SPI8_CLK (PZ2) | 23-24 | SAI1_MCLK_B (PD7) |
+| GND | 25-26 | SAI1_SCK_B (PD6) |
+| I2C3_SDA (PG2) | 27-28 | I2C3_SCL (PG1) |
+| SAI1_FS_B (PD5) | 29-30 | GND |
+| SAI1_SD_A (PD9) | 31-32 | SAI1_SD_B (PD4) |
+| I2C4_SCL (PD11) | 33-34 | GND |
+| I2C4_SDA (PD10) | 35-36 | LVDS_TP_RST (PB4) |
+| LVDS_BL (PB3) | 37-38 | LCD_BL (PD8) |
+| GND | 39-40 | RGB_TP_RST (PF13) |
 
 ## 四、Pinctrl子系统
 
@@ -165,6 +191,20 @@ uart4_pins_a: uart4-0 {
 │       └── OpenAMP_TTY_echo_CM33_NonSecure.elf
 ```
 
+### 5.1a BSP修改：COM_CM33切至LPUART1
+
+为释放UART4给雷达，将M33调试串口从UART4改为LPUART1。
+
+**修改文件**: `Drivers/BSP/STM32MP257F-EV1/stm32mp257f_eval.h`
+- `COM_CM33_UART`: UART4 → LPUART1
+- TX引脚: PB7(AF3) → PZ9(AF6)
+- RX引脚: PB6(AF3) → PZ4(AF6)
+- RIFSC资源: `RESMGR_RIFSC_UART4_ID` → `RESMGR_RIFSC_LPUART1_ID`
+
+**修改文件**: `CM33/NonSecure/Core/Src/main.c`
+- 移除 `#if 0` 屏蔽，直接调用`BSP_COM_Init(COM_VCP_CM33, ...)`
+- BSP_COM_Init内部自动处理LPUART1的RIFSC请求
+
 ### 5.2 编译命令
 
 ```bash
@@ -199,13 +239,24 @@ cat /sys/class/remoteproc/remoteproc0/state
 '
 ```
 
+### 5.2a A35设备树修改
+
+为释放PZ4/PZ9给M33 LPUART1使用，禁用I2C8节点（引脚冲突）。
+
+**修改文件**: `stm32mp257d-atk-ddr-1GB.dts`
+- `&i2c8`节点: `status = "okay"` → `status = "disabled"`
+
 ## 六、设备树编译
 
 ```bash
+# 编译RGB LCD版本DTB
 cd /home/alientek/linux/atk-mp257/kernel/linux/linux-6.6.48 && \
 unset LD_LIBRARY_PATH && \
 source /opt/st/stm32mp2/5.0.3-snapshot/environment-setup-cortexa35-ostl-linux 2>/dev/null && \
-make st/stm32mp257d-atk-ddr-1GB.dtb -j$(nproc)
+make st/stm32mp257d-atk-ddr-1GB-rgb.dtb -j$(nproc)
+
+# 部署DTB
+scp arch/arm64/boot/dts/st/stm32mp257d-atk-ddr-1GB-rgb.dtb root@192.168.88.10:/boot/
 ```
 
 ## 七、交叉编译

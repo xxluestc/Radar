@@ -1,5 +1,34 @@
 # 雷达BSD项目调试日志
 
+## 2026-05-16 调试记录
+
+### 问题4: M33调试串口与雷达通信串口冲突（最终方案）
+
+**需求**: M33调试串口(UART4)与雷达通信串口需要共存，但40pin排针上无其他空闲UART可用。
+
+**方案**: 将M33调试串口从UART4(PB6/PB7)切换到LPUART1(PZ9/PZ4)，释放UART4给雷达。
+
+**修改文件**:
+1. `stm32mp257f_eval.h`: COM_CM33从UART4(PB6/PB7/AF3)改为LPUART1(PZ9/PZ4/AF6)
+2. `main.c`: 移除`#if 0`屏蔽，启用BSP_COM_Init(COM_VCP_CM33)
+3. `stm32mp257d-atk-ddr-1GB.dts`: 禁用I2C8（PZ4/PZ9引脚冲突）
+
+**编译结果**: M33固件 0 errors, 0 warnings; DTB编译成功
+
+**部署后验证**:
+- M33状态: running
+- RPMsg通道: rpmsg-tty addr 0x400 创建成功
+- UART4: /dev/ttySTM3 可用，921600配置成功
+- dmesg: 无UART4/LPUART1/I2C8相关错误
+
+**最终资源分配**:
+```
+M33调试: LPUART1 (PZ9_TX/PZ4_RX) — 40pin pin7/pin11
+雷达通信: UART4   (PB7_TX/PB6_RX) — 40pin pin8/pin10
+```
+
+---
+
 ## 2026-05-09 调试记录
 
 ### 问题1: UART4设备节点不出现
