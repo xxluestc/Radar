@@ -13,7 +13,7 @@ import sys
 import struct
 from datetime import datetime
 
-PORT = "COM7"
+PORT = "COM9"
 BAUD = 921600
 DATA_BITS = 8
 STOP_BITS = 1
@@ -86,18 +86,18 @@ def read_status(ser: serial.Serial):
 
 
 def enable_bsd(ser: serial.Serial):
-    """组6 0xD1: 开启BSD感测功能"""
-    send_cmd(ser, 6, 0x11, name="开启感测功能(0xD1)")
+    """组6 0x11: 开启BSD感测功能"""
+    send_cmd(ser, 6, 0x11, bytes([0x01]), name="开启感测功能(0xD1)")
 
 
 def enable_bsd_detection(ser: serial.Serial):
     """组6 0x10: 开启BSD检测"""
-    send_cmd(ser, 6, 0x10, name="开启BSD检测(0xD0)")
+    send_cmd(ser, 6, 0x10, bytes([0x01]), name="开启BSD检测(0xD0)")
 
 
 def enable_auto_report(ser: serial.Serial):
     """组6 0x12: 开启自动上报"""
-    send_cmd(ser, 6, 0x12, name="开启自动上报(0xD2)")
+    send_cmd(ser, 6, 0x12, bytes([0x01]), name="开启自动上报(0xD2)")
 
 
 def set_baud(ser: serial.Serial, baud: int):
