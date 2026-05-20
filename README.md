@@ -45,9 +45,13 @@ PC 端 Python 脚本，通过 USB-TTL 直连雷达模块，用于快速验证雷
 
 **运行**:
 ```bash
-python radar_debug.py              # 默认配置BSD + 持续监控
+python radar_debug.py              # 默认配置BSD + 监控 + CSV记录
+python radar_debug.py -v           # 可视化模式 (鸟瞰图 + 距离/速度曲线)
 python radar_debug.py -m           # 仅监控（不发送配置命令）
 python radar_debug.py -s           # 波特率扫描 + 监控
+python radar_debug.py -l FILE      # 指定CSV日志文件名
+python radar_debug.py -r FILE      # 回放CSV日志
+python radar_debug.py -rv FILE     # 回放CSV日志 + 可视化
 python radar_debug.py 115200       # 指定波特率
 ```
 
@@ -56,6 +60,10 @@ python radar_debug.py 115200       # 指定波特率
 - 帧解析（0x5A上报 / 0x59回复 / 0x58命令）
 - 波特率扫描
 - 校验和自动计算（命令帧16-bit，上报帧8-bit）
+- **CSV数据记录**：每次运行自动保存到 `radar_log_YYYYMMDD_HHMMSS.csv`
+- **实时可视化**（`-v`）：鸟瞰图 + 距离/速度时间曲线 + 报警区域
+- **CSV回放**（`-r`）：离线分析历史数据，调整阈值后回放验证
+- **三级报警**：WARN / DANGER / CRITICAL，基于距离+接近速度组合判断
 
 **重要**: 雷达仅检测到有效目标才上报数据。首次建立检测需 **5 秒**。
 
@@ -66,6 +74,33 @@ python radar_debug.py 115200       # 指定波特率
 - 横向移动时速度为0，朝向/远离雷达移动时速度有值
 - 多目标跟踪正常（最多8个）
 - ⚠ 开启命令必须带参数 `0x01`，否则雷达不真正开启功能
+
+### 报警阈值设计
+
+BSD报警基于**距离 + 接近速度**的组合判断（速度为负 = 目标在靠近）：
+
+| 级别 | 距离阈值 | 速度阈值 | 含义 |
+|------|---------|---------|------|
+| WARN | ≤ 15m | ≤ -2 m/s | 后方有目标接近，注意 |
+| DANGER | ≤ 8m | ≤ -4 m/s | 后方目标快速接近，危险 |
+| CRITICAL | ≤ 4m | ≤ -1 m/s | 目标极近，紧急避让 |
+
+修改脚本顶部常量即可调整：
+```python
+ALARM_WARN_DIST = 15       # 预警距离(m)
+ALARM_WARN_SPEED = -2      # 预警速度(m/s, 负=接近)
+ALARM_DANGER_DIST = 8      # 危险距离(m)
+ALARM_DANGER_SPEED = -4    # 危险速度(m/s)
+ALARM_CRITICAL_DIST = 4    # 紧急距离(m)
+ALARM_CRITICAL_SPEED = -1  # 紧急速度(m/s)
+```
+
+### 阈值确定方法
+
+1. **采集数据**：在实际场景（骑电动车/站路边）运行 `python radar_debug.py`，记录多种情况
+2. **回放分析**：`python radar_debug.py -rv radar_log_xxx.csv`，观察距离/速度曲线
+3. **调整阈值**：修改脚本顶部常量，再次回放验证报警触发时机是否合理
+4. **确认阈值**：将最终阈值写入 `radar_bsd.c` 的 `-W` 和 `-S` 参数
 
 ---
 

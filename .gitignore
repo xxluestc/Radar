@@ -3,6 +3,7 @@ radar_bsd
 *.bin
 *.elf
 *.log
+*.csv
 *.pdf
 *.7z
 *.dll
