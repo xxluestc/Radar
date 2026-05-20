@@ -3,3 +3,9 @@ radar_bsd
 *.bin
 *.elf
 *.log
+*.pdf
+*.7z
+*.dll
+*.exe
+60GBSD汽车检测ATRearMonitorV0.2.4/
+__pycache__/
