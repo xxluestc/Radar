@@ -1,3 +1,22 @@
+/*
+ * MS60-1211S80M-BSD (AT6010) 雷达 BSD 监控程序 — 飞腾派 PE2204 版
+ * 基于 radar_bsd.c (MP257版) 改写，仅修改串口设备路径和波特率
+ * 雷达协议和配置命令与开发板无关，应用层代码完全一致
+ *
+ * 飞腾派串口映射:
+ *   - J1 DEBUG_UART1 (Pin7=TXD, Pin9=RXD) → /dev/ttyAMA1 (0x2800D000) [console占用]
+ *   - 40pin/J1 UART2 (Pin8=TXD, Pin10=RXD) → /dev/ttyAMA2 (0x2800E000)
+ *
+ * 编译 (交叉编译):
+ *   export PATH=/home/alientek/Phytium_syscode/GCC编译器/gcc-arm-10.2-2020.11-x86_64-aarch64-none-linux-gnu/bin:$PATH
+ *   aarch64-none-linux-gnu-gcc -Wall -O2 -o radar_phytium_bsd radar_phytium_bsd.c
+ *
+ * 运行:
+ *   ./radar_phytium_bsd              默认 /dev/ttyAMA2 @ 921600
+ *   ./radar_phytium_bsd -v           详细输出
+ *   ./radar_phytium_bsd -d /dev/ttyAMA2 -b 921600
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,7 +32,7 @@
 #include <sys/stat.h>
 #include <stdint.h>
 
-#define DEFAULT_UART_DEVICE  "/dev/ttySTM3"
+#define DEFAULT_UART_DEVICE  "/dev/ttyAMA2"
 #define DEFAULT_BAUDRATE     921600
 
 #define HEAD_CMD    0x58
@@ -380,8 +399,6 @@ static void print_usage(const char *prog)
     printf("  -v          Verbose output\n");
     printf("  -l FILE     Log to file\n");
     printf("  -n          Disable warning alerts\n");
-    printf("  -W DIST     Warning distance (default: %dm)\n", ALARM_WARN_DIST);
-    printf("  -S SPEED    Warning speed (default: %dm/s)\n", ALARM_WARN_SPEED);
     printf("  -h          Show this help\n");
     printf("\nAlarm thresholds:\n");
     printf("  WARN      : distance <= %dm && speed <= %dm/s\n", ALARM_WARN_DIST, ALARM_WARN_SPEED);
@@ -396,7 +413,7 @@ int main(int argc, char *argv[])
     const char *logfile = NULL;
 
     int opt;
-    while ((opt = getopt(argc, argv, "d:b:vl:nW:S:h")) != -1) {
+    while ((opt = getopt(argc, argv, "d:b:vl:nh")) != -1) {
         switch (opt) {
             case 'd': device = optarg; break;
             case 'b': baudrate = atoi(optarg); break;
@@ -426,16 +443,6 @@ int main(int argc, char *argv[])
     if (g_fd < 0) {
         fprintf(stderr, "Cannot open %s: %s\n", device, strerror(errno));
         return 1;
-    }
-
-    char pwr_path[256];
-    const char *tty_name = strrchr(device, '/');
-    tty_name = tty_name ? tty_name + 1 : device;
-    snprintf(pwr_path, sizeof(pwr_path), "/sys/class/tty/%s/device/power/control", tty_name);
-    FILE *fp = fopen(pwr_path, "w");
-    if (fp) {
-        fprintf(fp, "on");
-        fclose(fp);
     }
 
     if (set_uart(g_fd, baudrate) != 0) {
